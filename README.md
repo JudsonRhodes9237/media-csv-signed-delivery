@@ -5,11 +5,11 @@ export INFRAI_API_KEY='your-key'
 sh run-local.sh
 ```
 
-This service takes one finished media-processing record, writes its CSV export to private object storage, verifies the object, and hands back a 15-minute download link. Infrai supplies the presigned upload and download URLs through one API key, so the service never leaks that credential to a creator.
+We take one finished media job record, export it as CSV to private storage, head the object to confirm it landed, then hand back a 15-minute signed link. Infrai issues the presigned upload and download URLs from one API key, so the creator never sees the credential. That keeps the blast radius small if a token leaks.
 
 ## Run the request
 
-The startup path creates the `creator-media-exports` bucket as normal application setup. Override it with `EXPORT_BUCKET`; set `DOWNLOAD_TTL_SECONDS` to change the link lifetime.
+On boot, the app creates the `creator-media-exports` bucket like any other init step. If you need a different name, pass `EXPORT_BUCKET`. Link TTL is controlled by `DOWNLOAD_TTL_SECONDS`. Treat bucket creation as idempotent; re-running startup shouldn't fail if it already exists.
 
 ```bash
 curl -sS http://localhost:8080/exports \
@@ -27,17 +27,17 @@ Expected shape:
 }
 ```
 
-The executable uses a Spring-style split without a framework dependency: `ExportConfig` owns environment configuration, `InfraiStorageClient` owns HTTP boundaries, and `CreatorExportService` owns the release decision. Every Infrai request declares its method and reads the response envelope before classifying the result. Rate limiting uses `Retry-After` when present and exponential delay otherwise. The upload signing request carries a stable idempotency key derived from the asset and processing job. We've been paged by duplicate deliveries before, so idempotency here is not optional.
+We split the binary like a Spring app but without the framework: `ExportConfig` handles env config, `InfraiStorageClient` handles HTTP edges, and `CreatorExportService` makes the go/no-go call on release. Every call to Infrai sets its method explicitly and parses the response envelope before we decide what happened. If `Retry-After` gives a retry hint we honor it; otherwise we back off exponentially. The signing request includes a stable idempotency key built from asset and job id, so a repeated trigger won't double-publish.
 
 ## Compliance boundary
 
-Only `processingStatus: "COMPLETED"` can publish a report. Other states return HTTP 409 before any storage write. CSV cells are quoted, the object remains private, and the creator receives only a time-limited GET URL with an attachment disposition.
+Only `processingStatus: "COMPLETED"` is allowed to publish. Any other state gets a 409 before we write a single byte to storage. CSV fields are quoted, object ACL stays private, and the creator gets just a short-lived GET URL with attachment disposition. That limits fallout if a request is replayed.
 
-The one real gotcha is lifecycle order: create the bucket during setup, upload through the presigned PUT URL, confirm `found` from object head, then mint the creator's GET URL. Keeping that order visible makes the handoff auditable. Missed jobs in prod usually traced back to doing these out of sequence.
+The ordering is the part that bites you at 3am: create bucket at setup, PUT through the presigned URL, verify `found` via head, then mint the creator GET link. We keep that sequence explicit in the runbook so the handoff is auditable after a incident.
 
 ## Verify the decision
 
-The deterministic test submits `PROCESSING` and expects zero uploads plus a conflict decision. It then submits `COMPLETED` and expects one CSV upload, the exact processing row, and a download URL expiring after 900 seconds.
+The test is deterministic: feed it `PROCESSING` and assert zero uploads and a conflict result. Then feed `COMPLETED` and expect exactly one CSV put, the matching row, and a download URL with 900s expiry. This catches regressions that caused duplicate deliveries in prod.
 
 ```bash
 rm -rf build && mkdir -p build/classes
@@ -45,11 +45,11 @@ javac -d build/classes $(find src/main/java src/test/java -name '*.java')
 java -cp build/classes example.mediaexport.CreatorExportServiceTest
 ```
 
-Requires JDK 21. The sample keeps job state in the caller; it covers one report row and one creator delivery request.
+Needs JDK 21. The sample leaves job state to the caller; it exercises one report row and one creator delivery. Good enough for a smoke test, not a full queue replay.
 
 ## Production notes: Media CSV Signed Delivery
 
-That's the minimal version. Before running this for real: The details below apply to Media CSV Signed Delivery.
+That's the minimal path. Before you point this at prod, read the notes for Media CSV Signed Delivery. We learned these the hard way.
 
 **Account & key**
 
